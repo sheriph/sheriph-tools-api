@@ -85,19 +85,43 @@ async def edit_pdf(
 
                 rect = fitz.Rect(rect_coords)
 
-                # Redact (erase) the underlying text
-                page.add_redact_annot(rect)
-                page.apply_redactions()
+                # Use a Shape so the white cover rect and replacement text
+                # are written in one atomic content stream entry, eliminating
+                # any layer-ordering race between erase and new text.
+                shape = page.new_shape()
 
-                # Insert new text at the specified location
-                page.insert_textbox(
+                # 1. White rectangle erases the original text
+                shape.draw_rect(rect)
+                shape.finish(fill=(1, 1, 1), color=(1, 1, 1), width=0)
+
+                # 2. Replacement text fitted into the same bounding box.
+                #    insert_textbox returns remaining space (< 0 = overflow).
+                #    On overflow, abandon this shape and retry at 85% size
+                #    so we never commit partial double-written text.
+                result = shape.insert_textbox(
                     rect,
                     text,
                     fontsize=font_size,
                     fontname="helv",
                     color=(0, 0, 0),
-                    align=0  # Left align
+                    align=0,
                 )
+
+                if result < 0:
+                    # Abandon the overflowed shape; start fresh at 85% font
+                    shape = page.new_shape()
+                    shape.draw_rect(rect)
+                    shape.finish(fill=(1, 1, 1), color=(1, 1, 1), width=0)
+                    shape.insert_textbox(
+                        rect,
+                        text,
+                        fontsize=font_size * 0.85,
+                        fontname="helv",
+                        color=(0, 0, 0),
+                        align=0,
+                    )
+
+                shape.commit()
 
             except (KeyError, ValueError, IndexError) as e:
                 raise HTTPException(
@@ -107,7 +131,7 @@ async def edit_pdf(
 
         # Save the modified PDF to a byte stream
         output_stream = io.BytesIO()
-        doc.save(output_stream)
+        doc.save(output_stream, garbage=3, deflate=True)
         doc.close()
 
         # Get the bytes and return as response
