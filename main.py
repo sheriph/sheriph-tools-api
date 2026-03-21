@@ -94,32 +94,16 @@ async def edit_pdf(
                 shape.draw_rect(rect)
                 shape.finish(fill=(1, 1, 1), color=(1, 1, 1), width=0)
 
-                # 2. Replacement text fitted into the same bounding box.
-                #    insert_textbox returns remaining space (< 0 = overflow).
-                #    On overflow, abandon this shape and retry at 85% size
-                #    so we never commit partial double-written text.
-                result = shape.insert_textbox(
-                    rect,
+                # 2. Replacement text at the baseline of the rect.
+                #    insert_text never fails due to insufficient rect height.
+                baseline_y = rect.y0 + font_size
+                shape.insert_text(
+                    fitz.Point(rect.x0, baseline_y),
                     text,
                     fontsize=font_size,
                     fontname="helv",
                     color=(0, 0, 0),
-                    align=0,
                 )
-
-                if result < 0:
-                    # Abandon the overflowed shape; start fresh at 85% font
-                    shape = page.new_shape()
-                    shape.draw_rect(rect)
-                    shape.finish(fill=(1, 1, 1), color=(1, 1, 1), width=0)
-                    shape.insert_textbox(
-                        rect,
-                        text,
-                        fontsize=font_size * 0.85,
-                        fontname="helv",
-                        color=(0, 0, 0),
-                        align=0,
-                    )
 
                 shape.commit()
 
@@ -322,4 +306,91 @@ async def add_signatures(
         raise HTTPException(
             status_code=500,
             detail=f"PDF signing failed: {str(e)}"
+        )
+
+
+@app.post("/api/redact-pdf")
+async def redact_pdf(
+    file: UploadFile,
+    redactions: str = Form(...)
+):
+    """
+    Permanently redact areas of a PDF with black rectangles.
+
+    Args:
+        file: The PDF file to redact
+        redactions: JSON string array:
+                    [{"page": 0, "x_pct": 0.1, "y_pct": 0.2,
+                      "w_pct": 0.4, "h_pct": 0.05}]
+
+    Returns:
+        Redacted PDF file
+    """
+    try:
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="File must be a PDF")
+
+        try:
+            marks = json.loads(redactions)
+            if not isinstance(marks, list):
+                raise ValueError("redactions must be an array")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in redactions: {str(e)}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        if len(marks) == 0:
+            raise HTTPException(status_code=400, detail="At least one redaction is required")
+
+        pdf_bytes = await file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        for idx, m in enumerate(marks):
+            try:
+                required = ["page", "x_pct", "y_pct", "w_pct", "h_pct"]
+                if not all(k in m for k in required):
+                    raise ValueError(f"Redaction {idx} missing required fields")
+
+                page_num = m["page"]
+                if page_num < 0 or page_num >= len(doc):
+                    raise ValueError(f"Page {page_num} out of range (document has {len(doc)} pages)")
+
+                page = doc[page_num]
+                w = page.rect.width
+                h = page.rect.height
+
+                rect = fitz.Rect(
+                    m["x_pct"] * w,
+                    m["y_pct"] * h,
+                    (m["x_pct"] + m["w_pct"]) * w,
+                    (m["y_pct"] + m["h_pct"]) * h,
+                )
+                page.add_redact_annot(rect, fill=(0, 0, 0))
+
+            except (KeyError, ValueError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Error processing redaction {idx}: {str(e)}"
+                )
+
+        for page in doc:
+            page.apply_redactions()
+
+        buf = doc.tobytes(garbage=4, deflate=True)
+        doc.close()
+
+        return Response(
+            content=buf,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=redacted_{file.filename}"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF redaction failed: {str(e)}"
         )
