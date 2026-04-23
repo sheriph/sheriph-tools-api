@@ -9,8 +9,12 @@ RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install system dependencies (tesseract for OCR)
-RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr && rm -rf /var/lib/apt/lists/*
+# Install system dependencies (tesseract for OCR and libGL for OpenCV)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
